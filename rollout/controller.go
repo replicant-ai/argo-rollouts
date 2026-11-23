@@ -44,6 +44,7 @@ import (
 	"github.com/argoproj/argo-rollouts/rollout/trafficrouting/appmesh"
 	"github.com/argoproj/argo-rollouts/rollout/trafficrouting/istio"
 	analysisutil "github.com/argoproj/argo-rollouts/utils/analysis"
+	"github.com/argoproj/argo-rollouts/utils/annotations"
 	"github.com/argoproj/argo-rollouts/utils/conditions"
 	controllerutil "github.com/argoproj/argo-rollouts/utils/controller"
 	"github.com/argoproj/argo-rollouts/utils/defaults"
@@ -84,7 +85,7 @@ type Controller struct {
 	// rolloutVersionTracker remembers ResourceVersions from our last successful writes so
 	// syncHandler can requeue when the informer cache hasn't caught up yet.
 	rolloutVersionTracker *resourceversionutil.Tracker
-	// carryOverStatusReplicas defaults a nil .spec.replicas to .status.replicas instead of 1.
+	// carryOverStatusReplicas defaults a nil .spec.replicas to the last known replica count instead of 1.
 	carryOverStatusReplicas bool
 }
 
@@ -461,15 +462,15 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 
 	// In order to work with HPA, the rollout.Spec.Replica field cannot be nil. As a result, the controller will update
 	// the rollout to have the replicas field set to the default value. see https://github.com/argoproj/argo-rollouts/issues/119
-	if rollout.Spec.Replicas == nil {
-		// An HPA may have scaled the rollout anywhere between its min and max, so falling back to 1 would collapse it.
-		if c.carryOverStatusReplicas && rollout.Status.Replicas > 0 {
-			logCtx.Infof("Setting .spec.replicas to match .status.replicas (%d)", rollout.Status.Replicas)
-			r.Spec.Replicas = ptr.To(rollout.Status.Replicas)
-		} else {
-			logCtx.Info("Defaulting .spec.replica to 1")
-			r.Spec.Replicas = ptr.To[int32](defaults.DefaultReplicas)
+	if r.Spec.Replicas == nil {
+		replicas := defaults.DefaultReplicas
+		if c.carryOverStatusReplicas {
+			if lastReplicas := lastDesiredReplicas(roCtx); lastReplicas > 0 {
+				replicas = lastReplicas
+			}
 		}
+		logCtx.Infof("Defaulting .spec.replicas to %d", replicas)
+		r.Spec.Replicas = ptr.To(replicas)
 		newRollout, err := c.argoprojclientset.ArgoprojV1alpha1().Rollouts(r.Namespace).Update(ctx, r, metav1.UpdateOptions{})
 		if err != nil {
 			return err
@@ -491,6 +492,30 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 		c.rolloutVersionTracker.Record(key, roCtx.newRollout.ResourceVersion)
 	}
 	return nil
+}
+
+// lastDesiredReplicas returns the replica count last recorded on the serving ReplicaSet, so an HPA-scaled rollout
+// keeps its size instead of collapsing to 1. Status counts are a fallback because they include surge and canary pods.
+func lastDesiredReplicas(roCtx *rolloutContext) int32 {
+	servingRS := roCtx.stableRS
+	if roCtx.rollout.Spec.Strategy.BlueGreen != nil {
+		if activeRS, _ := replicasetutil.GetReplicaSetByTemplateHash(roCtx.allRSs, roCtx.rollout.Status.BlueGreen.ActiveSelector); activeRS != nil {
+			servingRS = activeRS
+		}
+	}
+	if servingRS != nil {
+		if desired, ok := annotations.GetDesiredReplicasAnnotation(servingRS); ok && desired > 0 {
+			return desired
+		}
+	}
+	fallback := roCtx.rollout.Status.Replicas
+	if roCtx.rollout.Status.HPAReplicas > 0 {
+		fallback = roCtx.rollout.Status.HPAReplicas
+	}
+	if fallback > 0 {
+		roCtx.log.Warnf("No desired-replicas annotation on the serving ReplicaSet; falling back to status replicas (%d), which can include canary or surge pods", fallback)
+	}
+	return fallback
 }
 
 func (c *Controller) newRolloutContext(rollout *v1alpha1.Rollout) (*rolloutContext, error) {

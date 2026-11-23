@@ -149,8 +149,7 @@ type fixture struct {
 	allowErrorOnLastSync bool
 	// workloadRefResolveFn, if set, is used by the fake workload ref resolver to repopulate the pod
 	// template (which remarshalRollout strips for TemplateResolvedFromRef rollouts), mimicking the real resolver.
-	workloadRefResolveFn func(*v1alpha1.Rollout) error
-	// carryOverStatusReplicas sets ControllerConfig.CarryOverStatusReplicas on the controller under test.
+	workloadRefResolveFn    func(*v1alpha1.Rollout) error
 	carryOverStatusReplicas bool
 }
 
@@ -1554,6 +1553,7 @@ func runSetReplicaFromNilSpec(t *testing.T, carryOverStatusReplicas bool, status
 	r := newCanaryRollout("foo", 1, nil, nil, nil, intstr.FromInt(0), intstr.FromInt(1))
 	r.Spec.Replicas = nil
 	r.Status.Replicas = statusReplicas
+	r.Status.HPAReplicas = statusReplicas
 	f.rolloutLister = append(f.rolloutLister, r)
 	f.objects = append(f.objects, r)
 
@@ -1578,6 +1578,108 @@ func TestSetReplicaToDefaultWhenCarryOverEnabledAndStatusIsZero(t *testing.T) {
 
 func TestSetReplicaToDefaultWhenCarryOverDisabled(t *testing.T) {
 	assert.Equal(t, defaults.DefaultReplicas, runSetReplicaFromNilSpec(t, false, 10))
+}
+
+func TestSetReplicaToStableReplicaSetDesiredReplicasWhenCarryOverEnabled(t *testing.T) {
+	f := newFixture(t)
+	defer f.Close()
+	f.carryOverStatusReplicas = true
+	r := newCanaryRollout("foo", 10, nil, nil, nil, intstr.FromInt(0), intstr.FromInt(1))
+	stableRS := newReplicaSetWithStatus(r, 10, 10)
+	r.Status.StableRS = stableRS.Labels[v1alpha1.DefaultRolloutUniqueLabelKey]
+	r.Spec.Replicas = nil
+	r.Status.Replicas = 15
+	r.Status.HPAReplicas = 15
+	f.rolloutLister = append(f.rolloutLister, r)
+	f.objects = append(f.objects, r)
+	f.replicaSetLister = append(f.replicaSetLister, stableRS)
+	f.kubeobjects = append(f.kubeobjects, stableRS)
+
+	updateIndex := f.expectUpdateRolloutAction(r)
+	f.run(getKey(r, t))
+	assert.Equal(t, int32(10), *f.getUpdatedRollout(updateIndex).Spec.Replicas)
+}
+
+func TestLastDesiredReplicasPrefersCanaryStableReplicaSetAnnotation(t *testing.T) {
+	r := newCanaryRollout("foo", 10, nil, nil, nil, intstr.FromInt(0), intstr.FromInt(1))
+	stableRS := newReplicaSetWithStatus(r, 10, 10)
+	r.Status.Replicas = 15
+	r.Status.HPAReplicas = 15
+	logger, hook := logtest.NewNullLogger()
+
+	roCtx := &rolloutContext{rollout: r, log: log.NewEntry(logger), stableRS: stableRS, allRSs: []*appsv1.ReplicaSet{stableRS}}
+
+	assert.Equal(t, int32(10), lastDesiredReplicas(roCtx))
+	assert.Empty(t, hook.AllEntries())
+}
+
+func TestLastDesiredReplicasPrefersBlueGreenActiveReplicaSetAnnotation(t *testing.T) {
+	r := newBlueGreenRollout("foo", 8, nil, "active", "preview")
+	activeRS := newReplicaSetWithStatus(r, 8, 6)
+	previewRS := activeRS.DeepCopy()
+	previewRS.Labels[v1alpha1.DefaultRolloutUniqueLabelKey] = "preview-hash"
+	r.Status.BlueGreen.ActiveSelector = activeRS.Labels[v1alpha1.DefaultRolloutUniqueLabelKey]
+	r.Status.Replicas = 14
+	r.Status.HPAReplicas = 6
+	logger, hook := logtest.NewNullLogger()
+
+	roCtx := &rolloutContext{rollout: r, log: log.NewEntry(logger), allRSs: []*appsv1.ReplicaSet{activeRS, previewRS}}
+
+	assert.Equal(t, int32(8), lastDesiredReplicas(roCtx))
+	assert.Empty(t, hook.AllEntries())
+}
+
+func TestLastDesiredReplicasUsesBlueGreenStableReplicaSetWhenActiveSelectorIsEmpty(t *testing.T) {
+	r := newBlueGreenRollout("foo", 8, nil, "active", "preview")
+	stableRS := newReplicaSetWithStatus(r, 8, 8)
+	r.Status.BlueGreen.ActiveSelector = ""
+	r.Status.Replicas = 16
+	r.Status.HPAReplicas = 16
+	logger, hook := logtest.NewNullLogger()
+
+	roCtx := &rolloutContext{rollout: r, log: log.NewEntry(logger), stableRS: stableRS, allRSs: []*appsv1.ReplicaSet{stableRS}}
+
+	assert.Equal(t, int32(8), lastDesiredReplicas(roCtx))
+	assert.Empty(t, hook.AllEntries())
+}
+
+func TestLastDesiredReplicasFallsBackToHPAReplicasWithoutAnnotation(t *testing.T) {
+	r := newBlueGreenRollout("foo", 8, nil, "active", "preview")
+	activeRS := newReplicaSetWithStatus(r, 8, 8)
+	delete(activeRS.Annotations, annotations.DesiredReplicasAnnotation)
+	r.Status.BlueGreen.ActiveSelector = activeRS.Labels[v1alpha1.DefaultRolloutUniqueLabelKey]
+	r.Status.Replicas = 16
+	r.Status.HPAReplicas = 8
+	logger, hook := logtest.NewNullLogger()
+
+	roCtx := &rolloutContext{rollout: r, log: log.NewEntry(logger), allRSs: []*appsv1.ReplicaSet{activeRS}}
+
+	assert.Equal(t, int32(8), lastDesiredReplicas(roCtx))
+	require.Len(t, hook.AllEntries(), 1)
+	assert.Equal(t, log.WarnLevel, hook.LastEntry().Level)
+	assert.Contains(t, hook.LastEntry().Message, "falling back to status replicas (8)")
+}
+
+func TestLastDesiredReplicasFallsBackToStatusReplicasWithoutReplicaSets(t *testing.T) {
+	r := newCanaryRollout("foo", 10, nil, nil, nil, intstr.FromInt(0), intstr.FromInt(1))
+	r.Status.Replicas = 10
+	logger, hook := logtest.NewNullLogger()
+
+	roCtx := &rolloutContext{rollout: r, log: log.NewEntry(logger)}
+
+	assert.Equal(t, int32(10), lastDesiredReplicas(roCtx))
+	require.Len(t, hook.AllEntries(), 1)
+	assert.Equal(t, log.WarnLevel, hook.LastEntry().Level)
+}
+
+func TestLastDesiredReplicasDoesNotWarnWhenNothingToCarryOver(t *testing.T) {
+	r := newCanaryRollout("foo", 10, nil, nil, nil, intstr.FromInt(0), intstr.FromInt(1))
+	logger, hook := logtest.NewNullLogger()
+
+	roCtx := &rolloutContext{rollout: r, log: log.NewEntry(logger)}
+
+	assert.Equal(t, int32(0), lastDesiredReplicas(roCtx))
+	assert.Empty(t, hook.AllEntries())
 }
 
 func TestSyncHandlerLogsUnderlyingErrorFromNewRolloutContext(t *testing.T) {
