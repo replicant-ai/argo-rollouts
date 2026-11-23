@@ -84,6 +84,8 @@ type Controller struct {
 	// rolloutVersionTracker remembers ResourceVersions from our last successful writes so
 	// syncHandler can requeue when the informer cache hasn't caught up yet.
 	rolloutVersionTracker *resourceversionutil.Tracker
+	// carryOverStatusReplicas defaults a nil .spec.replicas to .status.replicas instead of 1.
+	carryOverStatusReplicas bool
 }
 
 // ControllerConfig describes the data required to instantiate a new rollout controller
@@ -113,6 +115,7 @@ type ControllerConfig struct {
 	Recorder                        record.EventRecorder
 	EphemeralMetadataThreads        int
 	EphemeralMetadataPodRetries     int
+	CarryOverStatusReplicas         bool
 }
 
 // reconcilerBase is a shared datastructure containing all clients and configuration necessary to
@@ -215,13 +218,14 @@ func NewController(cfg ControllerConfig) *Controller {
 	}
 
 	controller := &Controller{
-		reconcilerBase:        base,
-		namespace:             cfg.Namespace,
-		replicaSetControl:     replicaSetControl,
-		rolloutWorkqueue:      cfg.RolloutWorkQueue,
-		serviceWorkqueue:      cfg.ServiceWorkQueue,
-		ingressWorkqueue:      cfg.IngressWorkQueue,
-		rolloutVersionTracker: resourceversionutil.NewTracker(),
+		reconcilerBase:          base,
+		namespace:               cfg.Namespace,
+		replicaSetControl:       replicaSetControl,
+		rolloutWorkqueue:        cfg.RolloutWorkQueue,
+		serviceWorkqueue:        cfg.ServiceWorkQueue,
+		ingressWorkqueue:        cfg.IngressWorkQueue,
+		rolloutVersionTracker:   resourceversionutil.NewTracker(),
+		carryOverStatusReplicas: cfg.CarryOverStatusReplicas,
 	}
 	controller.enqueueRollout = func(obj any) {
 		controllerutil.EnqueueRateLimited(obj, cfg.RolloutWorkQueue)
@@ -458,8 +462,14 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 	// In order to work with HPA, the rollout.Spec.Replica field cannot be nil. As a result, the controller will update
 	// the rollout to have the replicas field set to the default value. see https://github.com/argoproj/argo-rollouts/issues/119
 	if rollout.Spec.Replicas == nil {
-		logCtx.Info("Defaulting .spec.replica to 1")
-		r.Spec.Replicas = ptr.To[int32](defaults.DefaultReplicas)
+		// An HPA may have scaled the rollout anywhere between its min and max, so falling back to 1 would collapse it.
+		if c.carryOverStatusReplicas && rollout.Status.Replicas > 0 {
+			logCtx.Infof("Setting .spec.replicas to match .status.replicas (%d)", rollout.Status.Replicas)
+			r.Spec.Replicas = ptr.To(rollout.Status.Replicas)
+		} else {
+			logCtx.Info("Defaulting .spec.replica to 1")
+			r.Spec.Replicas = ptr.To[int32](defaults.DefaultReplicas)
+		}
 		newRollout, err := c.argoprojclientset.ArgoprojV1alpha1().Rollouts(r.Namespace).Update(ctx, r, metav1.UpdateOptions{})
 		if err != nil {
 			return err

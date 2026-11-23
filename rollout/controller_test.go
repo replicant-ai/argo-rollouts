@@ -150,6 +150,8 @@ type fixture struct {
 	// workloadRefResolveFn, if set, is used by the fake workload ref resolver to repopulate the pod
 	// template (which remarshalRollout strips for TemplateResolvedFromRef rollouts), mimicking the real resolver.
 	workloadRefResolveFn func(*v1alpha1.Rollout) error
+	// carryOverStatusReplicas sets ControllerConfig.CarryOverStatusReplicas on the controller under test.
+	carryOverStatusReplicas bool
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -676,6 +678,7 @@ func (f *fixture) newController(resync resyncFunc) (*Controller, informers.Share
 		RefResolver:                     &FakeWorkloadRefResolver{resolveFn: f.workloadRefResolveFn},
 		EphemeralMetadataThreads:        DefaultEphemeralMetadataThreads,
 		EphemeralMetadataPodRetries:     DefaultEphemeralMetadataPodRetries,
+		CarryOverStatusReplicas:         f.carryOverStatusReplicas,
 	})
 
 	c.enqueueRollout = func(obj any) {
@@ -1541,6 +1544,40 @@ func TestSetReplicaToDefault(t *testing.T) {
 	f.runWithSyncs(getKey(r, t), 3)
 	updatedRollout := f.getUpdatedRollout(updateIndex)
 	assert.Equal(t, defaults.DefaultReplicas, *updatedRollout.Spec.Replicas)
+}
+
+func runSetReplicaFromNilSpec(t *testing.T, carryOverStatusReplicas bool, statusReplicas int32) int32 {
+	t.Helper()
+	f := newFixture(t)
+	defer f.Close()
+	f.carryOverStatusReplicas = carryOverStatusReplicas
+	r := newCanaryRollout("foo", 1, nil, nil, nil, intstr.FromInt(0), intstr.FromInt(1))
+	r.Spec.Replicas = nil
+	r.Status.Replicas = statusReplicas
+	f.rolloutLister = append(f.rolloutLister, r)
+	f.objects = append(f.objects, r)
+
+	f.expectUpdateRolloutStatusAction(r)
+	f.expectGetRolloutAction(r)
+	updateIndex := f.expectUpdateRolloutAction(r)
+	f.expectGetRolloutAction(r)
+	f.expectPatchRolloutAction(r)
+	f.expectCreateReplicaSetAction(&appsv1.ReplicaSet{})
+	f.expectUpdateReplicaSetAction(&appsv1.ReplicaSet{})
+	f.runWithSyncs(getKey(r, t), 3)
+	return *f.getUpdatedRollout(updateIndex).Spec.Replicas
+}
+
+func TestSetReplicaToStatusReplicasWhenCarryOverEnabled(t *testing.T) {
+	assert.Equal(t, int32(10), runSetReplicaFromNilSpec(t, true, 10))
+}
+
+func TestSetReplicaToDefaultWhenCarryOverEnabledAndStatusIsZero(t *testing.T) {
+	assert.Equal(t, defaults.DefaultReplicas, runSetReplicaFromNilSpec(t, true, 0))
+}
+
+func TestSetReplicaToDefaultWhenCarryOverDisabled(t *testing.T) {
+	assert.Equal(t, defaults.DefaultReplicas, runSetReplicaFromNilSpec(t, false, 10))
 }
 
 func TestSyncHandlerLogsUnderlyingErrorFromNewRolloutContext(t *testing.T) {

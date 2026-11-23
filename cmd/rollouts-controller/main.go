@@ -88,6 +88,7 @@ func newCommand() *cobra.Command {
 		namespaced                     bool
 		printVersion                   bool
 		selfServiceNotificationEnabled bool
+		carryOverStatusReplicas        bool
 		controllersEnabled             []string
 		pprofAddress                   string
 		analysisSharedSecretNamespace  string
@@ -315,6 +316,7 @@ func newCommand() *cobra.Command {
 					ephemeralMetadataThreads,
 					ephemeralMetadataPodRetries,
 					selfServiceNotificationEnabled,
+					carryOverStatusReplicas,
 					analysisSharedSecretNamespace,
 					analysis.SharedSecretMode(analysisSharedSecretMode))
 			}
@@ -368,6 +370,7 @@ func newCommand() *cobra.Command {
 	command.Flags().DurationVar(&electOpts.LeaderElectionRenewDeadline, "leader-election-renew-deadline", controller.DefaultLeaderElectionRenewDeadline, "The interval between attempts by the acting master to renew a leadership slot before it stops leading. This must be less than or equal to the lease duration. This is only applicable if leader election is enabled.")
 	command.Flags().DurationVar(&electOpts.LeaderElectionRetryPeriod, "leader-election-retry-period", controller.DefaultLeaderElectionRetryPeriod, "The duration the clients should wait between attempting acquisition and renewal of a leadership. This is only applicable if leader election is enabled.")
 	command.Flags().BoolVar(&selfServiceNotificationEnabled, "self-service-notification-enabled", false, "Allows rollouts controller to pull notification config from the namespace that the rollout resource is in. This is useful for self-service notification.")
+	command.Flags().BoolVar(&carryOverStatusReplicas, "carry-over-status-replicas", false, "When a Rollout has no .spec.replicas, default it to the current .status.replicas instead of 1. Prevents HPA-scaled rollouts from collapsing to one replica after a replace (e.g. helm upgrade --force).")
 	command.Flags().StringSliceVar(&controllersEnabled, "controllers", nil, "Explicitly specify the list of controllers to run, currently only supports 'analysis', eg. --controller=analysis. Default: all controllers are enabled")
 	command.Flags().StringVar(&pprofAddress, "enable-pprof-address", "", "Enable pprof profiling on controller by providing a server address.")
 	command.Flags().StringVar(&analysisSharedSecretNamespace, "analysis-shared-secret-namespace", "", "Namespace containing secrets that may be referenced by AnalysisRuns")

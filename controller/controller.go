@@ -313,6 +313,7 @@ func NewManager(
 	ephemeralMetadataThreads int,
 	ephemeralMetadataPodRetries int,
 	selfServiceNotificationEnabled bool,
+	carryOverStatusReplicas bool,
 	analysisSharedSecretNamespace string,
 	analysisSharedSecretMode analysis.SharedSecretMode,
 ) *Manager {
@@ -376,6 +377,7 @@ func NewManager(
 		Recorder:                        recorder,
 		EphemeralMetadataThreads:        ephemeralMetadataThreads,
 		EphemeralMetadataPodRetries:     ephemeralMetadataPodRetries,
+		CarryOverStatusReplicas:         carryOverStatusReplicas,
 	})
 
 	experimentController := experiments.NewController(experiments.ControllerConfig{
